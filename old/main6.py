@@ -40,7 +40,8 @@ def pan_lfo(base_pan=0.0, speed=0.01, depth=0.2):
 def microtonal_drift(freq, drift_speed=0.01, drift_depth=0.002):
     return freq * (1 + np.sin(time.time()*drift_speed)*drift_depth)
 
-def add_harmonics(freq, base_amp, t, num_harmonics=3):
+max_harmonics = 3
+def add_harmonics(freq, base_amp, t, num_harmonics=max_harmonics):
     signal = np.zeros_like(t)
     for i in range(1, num_harmonics+1):
         detune = freq*(i + random.uniform(-0.01,0.01))
@@ -250,6 +251,30 @@ def apply_reverb(stereo):
     stereo[:,1] = right
     return stereo
 
+# ---------------- SCENE SCRIPT ----------------
+class SceneScript:
+    def __init__(self):
+        # Each scene: duration (seconds), amplitude, density, harmonic complexity, mood
+        self.scenes = [
+            {'duration': 60, 'amp':0.3, 'density':10, 'harmonics':2, 'mood':'calm'},
+            {'duration': 90, 'amp':0.6, 'density':20, 'harmonics':3, 'mood':'expansive'},
+            {'duration': 120, 'amp':0.8, 'density':25, 'harmonics':4, 'mood':'mysterious'},
+            {'duration': 90, 'amp':0.5, 'density':15, 'harmonics':3, 'mood':'ethereal'},
+            {'duration': 120, 'amp':0.7, 'density':30, 'harmonics':5, 'mood':'climactic'}
+        ]
+        self.current_index = 0
+        self.start_time = time.time()
+    def current_scene(self):
+        return self.scenes[self.current_index]
+    def update(self):
+        elapsed = time.time() - self.start_time
+        if elapsed > self.scenes[self.current_index]['duration']:
+            self.current_index = (self.current_index + 1) % len(self.scenes)
+            self.start_time = time.time()
+            print(f"Transitioning to scene {self.current_index}: {self.scenes[self.current_index]['mood']}")
+
+scene_script = SceneScript()
+
 # ---------------- STATE ----------------
 grains=[]
 active_events=[]
@@ -263,14 +288,32 @@ my_filter = Filter(2000)
 
 # ---------------- AUDIO CALLBACK ----------------
 def audio_callback(outdata, frames, time_info, status):
-    global grains, active_events, active_motifs, drones, chord_pads, my_filter, bg_texture, active_shimmers, active_env_triggers
+    global grains, active_events, active_motifs, drones, chord_pads, my_filter, bg_texture, active_shimmers, active_env_triggers, max_harmonics
     stereo = np.zeros((buffer_size,2))
     buffer = np.zeros(buffer_size)
 
+    # --- UPDATE SCENE SCRIPT ---
+    scene_script.update()
+    scene_data = scene_script.current_scene()
+    target_amp = scene_data['amp']
+    target_density = scene_data['density']
+    max_harmonics = scene_data['harmonics']
+    mood = scene_data['mood']
+
+    # Adjust filter cutoff based on mood
+    if mood=='calm': my_filter.cutoff = 3000
+    elif mood=='expansive': my_filter.cutoff = 5000
+    elif mood=='mysterious': my_filter.cutoff = 2000
+    elif mood=='ethereal': my_filter.cutoff = 6000
+    elif mood=='climactic': my_filter.cutoff = 8000
+
     # --- GRAINS ---
+    while len(grains) < target_density:
+        grains.append(Grain())
     for grain in grains:
         l,r = grain.generate(t)
         stereo[:,0]+=l; stereo[:,1]+=r; buffer+=l+r
+        grain.amp *= target_amp
 
     # --- EVENTS ---
     remaining_events=[]
@@ -292,11 +335,13 @@ def audio_callback(outdata, frames, time_info, status):
     for drone in drones:
         l,r = drone.generate(t)
         stereo[:,0]+=l; stereo[:,1]+=r
+        drone.amp *= target_amp
 
     # --- CHORD PADS ---
     for pad in chord_pads:
         l,r = pad.generate(t)
         stereo[:,0]+=l; stereo[:,1]+=r
+        pad.amp *= target_amp
 
     # --- BACKGROUND TEXTURE ---
     l,r = bg_texture.generate(t)
@@ -311,7 +356,7 @@ def audio_callback(outdata, frames, time_info, status):
     active_shimmers = remaining_shimmers
     if random.random() < 0.01: active_shimmers.append(Shimmer())
 
-    # --- FFT ---
+    # --- FFT SPECTRUM ---
     spectrum = np.fft.rfft(buffer)
     freqs = np.fft.rfftfreq(len(buffer),1/sample_rate)
     mag = np.abs(spectrum)
@@ -326,42 +371,31 @@ def audio_callback(outdata, frames, time_info, status):
     motif_density = len(active_motifs)/10.0
     env.adaptive_modulation(low,mid,high,motif_density)
 
-    # --- SPAWN GRAINS & MOTIFS ---
-    if len(grains)<20: grains.append(Grain())
+    # --- SPAWN MOTIFS AND EVENTS ---
     if random.random()<0.005: active_motifs.append(Motif(env.chords[env.current_chord_idx]))
     if random.random()<0.01: active_events.append(Event(random.choice(['drone','shimmer','hit'])))
 
     # --- SPECTRAL TRIGGERS ---
     new_trigger = spawn_spectral_trigger(low, mid, high)
     if new_trigger: active_env_triggers.append(new_trigger)
-
     remaining_triggers=[]
     for trigger in active_env_triggers:
-        # optional amplitude scaling based on FFT
-        if trigger.type=='bell': trigger.amp *= min(1.0, high*10)
-        if trigger.type=='wind': trigger.amp *= min(1.0, low*10)
-        if trigger.type=='hit': trigger.amp *= min(1.0, mid*10)
         l,r,alive = trigger.generate(t)
         stereo[:,0]+=l; stereo[:,1]+=r
         if alive: remaining_triggers.append(trigger)
     active_env_triggers = remaining_triggers
 
-    # --- REVERB ---
+    # --- REVERB & FILTER ---
     stereo = apply_reverb(stereo)
-
-    # --- FILTER ---
-    my_filter.cutoff = 2000 + 1000*np.sin(time.time()*0.01)
     stereo = my_filter.process(stereo)
 
     # --- NORMALIZE ---
     stereo = stereo / max(1, np.max(np.abs(stereo)))
-
-    # --- OUTPUT ---
     outdata[:] = stereo
 
 # ---------------- RUN ----------------
 with sd.OutputStream(channels=2, callback=audio_callback, samplerate=sample_rate, blocksize=buffer_size):
-    print("Fully procedural cinematic ambient engine running. Press Ctrl+C to stop.")
+    print("Procedural cinematic ambient engine with scene scripting running. Press Ctrl+C to stop.")
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt:

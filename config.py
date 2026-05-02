@@ -1,0 +1,4 @@
+# config.py
+SAMPLE_RATE = 44100
+BUFFER_SIZE = 512
+DTYPE = 'float32'
